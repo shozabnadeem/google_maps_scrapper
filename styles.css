@@ -1,0 +1,118 @@
+.scraper-overlay {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 10000;
+  background: rgba(0, 0, 0, 0.9);
+  color: white;
+  padding: 15px;
+  border-radius: 8px;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  font-size: 12px;
+  min-width: 250px;
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+}
+
+.scraper-overlay.hidden {
+  display: none;
+}
+
+.scraper-status {
+  display: flex;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.scraper-status-icon {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  margin-right: 8px;
+  animation: pulse 2s infinite;
+}
+
+.scraper-status-icon.active {
+  background: #4CAF50;
+}
+
+.scraper-status-icon.inactive {
+  background: #f44336;
+  animation: none;
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.5; }
+  100% { opacity: 1; }
+}
+
+.scraper-progress {
+  background: rgba(255, 255, 255, 0.1);
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  margin: 8px 0;
+}
+
+.scraper-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #4CAF50, #45a049);
+  transition: width 0.3s ease;
+  width: 0%;
+}
+
+.scraper-stats {
+  font-size: 11px;
+  opacity: 0.8;
+  margin-top: 5px;
+}
+
+.scraper-controls {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.scraper-btn {
+  padding: 6px 12px;
+  border: none;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.scraper-btn.start {
+  background: #4CAF50;
+  color: white;
+}
+
+.scraper-btn.stop {
+  background: #f44336;
+  color: white;
+}
+
+.scraper-btn:hover {
+  opacity: 0.8;
+}
+
+.scraper-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Highlight scraped elements */
+.maps-scraper-highlight {
+  outline: 2px solid #4CAF50 !important;
+  outline-offset: 2px;
+  background: rgba(76, 175, 80, 0.1) !important;
+  transition: all 0.3s ease;
+}
+
+.maps-scraper-processing {
+  outline: 2px solid #FF9800 !important;
+  outline-offset: 2px;
+  background: rgba(255, 152, 0, 0.1) !important;
+}

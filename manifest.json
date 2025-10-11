@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Google Maps Results Scraper",
+  "version": "1.0",
+  "description": "Scrape all Google Maps search results with pagination support",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "downloads",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "https://www.google.com/*",
+    "https://maps.google.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.google.com/maps/*",
+        "https://maps.google.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["styles.css"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Google Maps Scraper"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
