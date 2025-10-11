@@ -1,4 +1,4 @@
-# Google Maps Results Scraper
+# Vibe Coded Google Maps Results Scraper
 
 A Chrome extension that scrapes Google Maps search results with automatic pagination handling.
 
