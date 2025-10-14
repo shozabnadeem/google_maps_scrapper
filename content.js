@@ -5,7 +5,7 @@ class GoogleMapsScraper {
     this.results = [];
     this.processedElements = new Set();
     this.settings = {
-      delay: 2000,
+      delay: 4000,
       maxResults: 0
     };
     this.scrollAttempts = 0;
