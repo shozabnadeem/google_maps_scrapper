@@ -262,7 +262,8 @@ class GoogleMapsScraper {
       '[jsaction*="pane.resultList"]',
       '.Nv2PK',
       '.section-scrollbox',
-      '[aria-label*="Results for"]'
+      '[aria-label*="Results for"]',
+      '.Nv2PK.THOPZb.CpccDe'
     ];
 
     for (const selector of selectors) {
@@ -305,12 +306,25 @@ class GoogleMapsScraper {
       
       const elementId = this.getElementId(element);
       if (this.processedElements.has(elementId)) {
+        console.log('Skipping already processed element:', elementId);
         continue;
       }
 
       try {
         const resultData = await this.extractResultData(element);
         if (resultData && this.isValidResult(resultData)) {
+          // Additional duplicate check by business name
+          const isDuplicate = this.results.some(existing => 
+            existing.name.toLowerCase().trim() === resultData.name.toLowerCase().trim() &&
+            existing.address.toLowerCase().trim() === resultData.address.toLowerCase().trim()
+          );
+          
+          if (isDuplicate) {
+            console.log('Skipping duplicate business:', resultData.name);
+            this.processedElements.add(elementId);
+            continue;
+          }
+          
           this.results.push(resultData);
           this.processedElements.add(elementId);
           
@@ -323,6 +337,10 @@ class GoogleMapsScraper {
             return;
           }
         }
+        
+        // Add small delay between processing elements to avoid overwhelming the page
+        await new Promise(resolve => setTimeout(resolve, 200));
+        
       } catch (error) {
         console.error('Error scraping result:', error);
       }
@@ -330,59 +348,104 @@ class GoogleMapsScraper {
   }
 
   findResultElements() {
-    // Multiple selectors to find result elements across different Google Maps layouts
-    const selectors = [
-      '[data-result-index]',
-      '.bfdHYd',
-      '[jsaction*="pane.resultList.click"]',
-      '[data-feature-id]',
-      '.Nv2PK .TFQHme',
-      '[role="article"]',
-      '.section-result',
-      '.section-result-content',
-      '[aria-label][data-value="Directions"]'
-    ];
-
+    // Use the specific selector you prefer
+    const selector = '.Nv2PK.THOPZb';
+    // Nv2PK tH5CWc THOPZb
+    // Nv2PK THOPZb CpccDe
     const elements = new Set();
     
-    for (const selector of selectors) {
+    try {
       const found = document.querySelectorAll(selector);
+      console.log(`Found ${found.length} elements with selector: ${selector}`);
+      
       found.forEach(el => {
-        // Only add if it looks like a business result
-        if (this.looksLikeBusinessResult(el)) {
+        const text = el.textContent.toLowerCase();
+        
+        // Skip sponsored/ad results
+        const isSponsored = el.querySelector('[aria-label="Sponsored"]') || 
+                           el.querySelector('[aria-label*="Sponsored"]') ||
+                           text.includes('sponsored') ||
+                           text.includes('advertisement') ||
+                           el.querySelector('.jHLihd');
+        
+        if (!isSponsored) {
           elements.add(el);
+        } else {
+          console.log('Skipping sponsored result');
         }
       });
+    } catch (error) {
+      console.log('Selector failed:', selector, error);
     }
-
+    
+    console.log(`Returning ${elements.size} non-sponsored elements`);
     return Array.from(elements);
   }
 
   looksLikeBusinessResult(element) {
     // Check if element contains business-like content
     const text = element.textContent.toLowerCase();
-    const hasRating = element.querySelector('[role="img"][aria-label*="star"], .MW4etd, [aria-label*="rating"]');
+    
+    // Skip sponsored/ad results
+    const isSponsored = element.querySelector('[aria-label="Sponsored"]') || 
+                       element.querySelector('[aria-label*="Sponsored"]') ||
+                       text.includes('sponsored') ||
+                       text.includes('advertisement') ||
+                       element.querySelector('.jHLihd'); // Common sponsored indicator class
+    
+    if (isSponsored) {
+      console.log('Skipping sponsored/ad result');
+      return false;
+    }
+    
+    // Strong indicators of business listings
+    const hasRating = element.querySelector('[role="img"][aria-label*="star"], .MW4etd, [aria-label*="rating"], [aria-label*="stars"]');
     const hasName = element.querySelector('.fontHeadlineSmall, .section-result-title, h3, [role="button"]');
     const hasAddress = text.includes('·') || text.includes(',') || element.querySelector('[data-value="Address"]');
+    const hasWebsite = element.querySelector('a[href*="http"]:not([href*="google.com"]):not([href*="gstatic.com"])');
+    const hasPhone = /\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/.test(text);
+    const hasDirections = element.querySelector('[data-value="Directions"]');
     
-    return (hasName && (hasRating || hasAddress)) || 
-           (element.querySelector('[data-value="Directions"]') && hasName);
+    // Hotel/restaurant specific indicators
+    const hasBookingLink = element.querySelector('a[href*="booking"], a[href*="reservation"], a[href*="hotel"], a[href*="zenhotels"]');
+    const hasHotelKeywords = /hotel|inn|resort|lodge|motel|hostel|b&b|bed and breakfast/i.test(text);
+    const hasRestaurantKeywords = /restaurant|cafe|diner|bistro|eatery|food|cuisine/i.test(text);
+    
+    // Business type indicators
+    const hasBusinessKeywords = /agency|company|service|office|shop|store|center|clinic|salon/i.test(text);
+    
+    // Minimum requirements for a business result
+    const hasBasicInfo = hasName && (hasRating || hasAddress || hasWebsite || hasPhone);
+    const hasBusinessIndicators = hasDirections || hasBookingLink || hasHotelKeywords || hasRestaurantKeywords || hasBusinessKeywords;
+    
+    // Additional quality checks
+    const hasReasonableTextLength = text.length > 20 && text.length < 5000;
+    const notLoadingOrError = !text.includes('loading') && !text.includes('error') && !text.includes('search');
+    
+    return hasBasicInfo && hasBusinessIndicators && hasReasonableTextLength && notLoadingOrError;
   }
 
   getElementId(element) {
     // Create a unique identifier for the element
-    return element.getAttribute('data-result-index') ||
-           element.getAttribute('data-feature-id') ||
-           element.getAttribute('data-fid') ||
-           this.getTextBasedId(element);
-  }
-
-  getTextBasedId(element) {
-    // Use the business name as ID if no other identifier exists
-    const nameElement = element.querySelector('.fontHeadlineSmall, .section-result-title, h3, [role="button"]');
+    const dataId = element.getAttribute('data-result-index') ||
+                  element.getAttribute('data-feature-id') ||
+                  element.getAttribute('data-fid');
+    
+    if (dataId) {
+      return dataId;
+    }
+    
+    // Use business name + address combination for unique ID
+    const nameElement = element.querySelector('.fontHeadlineSmall, .section-result-title, h3, [role="button"], .qBF1Pd');
     const name = nameElement ? nameElement.textContent.trim() : '';
-    const position = Array.from(element.parentNode.children).indexOf(element);
-    return `${name}_${position}`.replace(/[^a-zA-Z0-9_]/g, '_');
+    
+    // Try to get address for more uniqueness
+    const addressElement = element.querySelector('.W4Efsd, [data-value="Address"]');
+    const address = addressElement ? addressElement.textContent.trim() : '';
+    
+    // Create a more unique identifier using name + partial address
+    const uniqueId = `${name}_${address.substring(0, 20)}`.replace(/[^a-zA-Z0-9_]/g, '_');
+    return uniqueId || `element_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   }
 
   async extractResultData(element) {
@@ -403,7 +466,7 @@ class GoogleMapsScraper {
       const phone = this.extractPhone(element);
       
       // Extract website
-      const website = this.extractWebsite(element);
+      const website = await this.extractWebsite(element);
       
       // Extract opening hours
       const hours = this.extractHours(element);
@@ -549,9 +612,207 @@ class GoogleMapsScraper {
     return match ? match[0] : null;
   }
 
-  extractWebsite(element) {
-    const websiteElement = element.querySelector('a[href*="http"]');
-    return websiteElement ? websiteElement.href : null;
+  async extractWebsite(element) {
+    console.log('Extracting website for element:');
+    // Try multiple selectors for different business types and layouts
+    const websiteSelectors = [
+      // Standard website links
+      'a[href*="http"]:not([href*="google.com"]):not([href*="maps.google"])',
+      
+      // Hotel booking links (like ZenHotels, Booking.com, etc.)
+      'a.xhX3nf[href*="http"]',
+      'a[data-url*="http"]',
+      
+      // Business website links
+      '[data-value="Website"] a',
+      '[aria-label*="Website"] a',
+      
+      // Review platform links that might lead to business sites
+      'a[href*="http"]:not([href*="google.com"]):not([href*="gstatic.com"]):not([href*="googleusercontent.com"])',
+      
+      // Booking and reservation links
+      'a[href*="booking"]',
+      'a[href*="reservation"]',
+      'a[href*="hotel"]',
+      'a[href*="restaurant"]',
+      
+      // Social media and business directory links
+      'a[href*="facebook.com"]',
+      'a[href*="instagram.com"]',
+      'a[href*="linkedin.com"]',
+      'a[href*="yelp.com"]',
+      'a[href*="tripadvisor.com"]'
+    ];
+
+    let fallbackUrl = null;
+
+    for (const selector of websiteSelectors) {
+      const linkElements = element.querySelectorAll(selector);
+      
+      for (const link of linkElements) {
+        let url = link.href || link.getAttribute('data-url') || link.getAttribute('data-href');
+        
+        if (url) {
+          // Clean up the URL
+          url = url.trim();
+          
+          // Skip Google-related URLs
+          if (url.includes('google.com') || 
+              url.includes('gstatic.com') || 
+              url.includes('googleusercontent.com') ||
+              url.includes('maps.google') ||
+              url.startsWith('javascript:') ||
+              url.startsWith('tel:') ||
+              url.startsWith('mailto:')) {
+            continue;
+          }
+          
+          // Prefer direct business websites over booking platforms
+          if (this.isDirectBusinessWebsite(url)) {
+            return url;
+          }
+          
+          // Store booking/platform URLs as fallback
+          if (this.isValidBusinessURL(url)) {
+            // Continue looking for better URLs, but keep this as fallback
+            fallbackUrl = url;
+          }
+        }
+      }
+    }
+    
+    // If no website found in current view, try clicking the business to open modal
+    if (!fallbackUrl) {
+      try {
+        const businessName = element.querySelector('.qBF1Pd, .fontHeadlineSmall, [class*="headline"]')?.textContent?.trim();
+        const clickableElement = element.querySelector('.hfpxzc, [jsaction*="pane.wfvdle"], button[aria-label*="' + businessName + '"]');
+        
+        if (clickableElement && businessName) {
+          console.log(`Clicking ${businessName} to check for website in modal...`);
+          
+          // Click the element to open modal
+          clickableElement.click();
+          
+          // Wait for modal to load
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+          // Try to extract website from the modal
+          const modal = document.querySelector('.bJzME, .k7jAl, [role="main"][aria-label*="' + businessName + '"], .m6QErb.XiKgde.tLjsW.UhIuC');
+          if (modal) {
+            // First try the most reliable method - Website aria-label
+            const websiteAnchor = document.querySelector('[aria-label*="Website:"]');
+            console.log('anchor', websiteAnchor);
+            if (websiteAnchor && websiteAnchor.href) {
+              const url = websiteAnchor.href;
+              if (url && this.isValidBusinessURL(url) && !url.includes('google.com/search')) {
+                console.log(`Found website via aria-label in modal: ${url}`);
+                await this.closeModal(modal);
+                return url.trim();
+              }
+            }
+            
+            // Fallback: Look for website in modal using other selectors
+            const modalSelectors = [
+              // Direct website link
+              'a[data-item-id="authority"]',
+              '.CsEnBe[data-item-id="authority"]',
+              '.RcCsl[data-item-id="authority"] a',
+              
+              // Website links in modal
+              'a[href*="://"]:not([href*="google.com"]):not([href*="maps"]):not([href*="gstatic"])',
+              '[aria-label*="Website"] a',
+              'a[target="_blank"]:not([href*="google.com"])',
+              'a[jsaction*="website"]',
+              
+              // Hotel specific booking links
+              'a[href*="hotel"]',
+              'a[href*="booking"]',
+              'a.SlvSdc[href*="http"]',
+              
+              // Look for text content that might be a website
+              '.Io6YTe.fontBodyMedium.kR99db.fdkmkc'
+            ];
+            
+            for (const selector of modalSelectors) {
+              const links = modal.querySelectorAll(selector);
+              for (const link of links) {
+                let url = link.href || link.getAttribute('href') || link.textContent;
+                
+                // Clean the URL if it's just text content
+                if (url && !url.startsWith('http') && url.includes('.')) {
+                  // If it looks like a domain, add https://
+                  if (url.match(/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/)) {
+                    url = 'https://' + url;
+                  }
+                }
+                
+                if (url && this.isValidBusinessURL(url) && !url.includes('google.com')) {
+                  console.log(`Found website in modal: ${url}`);
+                  
+                  // Close modal
+                  await this.closeModal(modal);
+                  return url.trim();
+                }
+              }
+            }
+            
+            // Close modal if no website found
+            await this.closeModal(modal);
+          }
+        }
+      } catch (error) {
+        console.log('Error extracting website from modal:', error);
+      }
+    }
+    
+    // Return fallback URL if found (booking sites, social media, etc.)
+    return fallbackUrl || null;
+  }
+
+  async closeModal(modal) {
+    try {
+      // Try multiple ways to close the modal
+      const closeButton = modal.querySelector('[aria-label="Close"], .VfPpkd-icon-LgbsSe, [jsaction*="close"]');
+      if (closeButton) {
+        closeButton.click();
+      } else {
+        // Press escape key
+        document.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Escape',
+          code: 'Escape',
+          keyCode: 27,
+          charCode: 27,
+          bubbles: true
+        }));
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } catch (error) {
+      console.log('Error closing modal:', error);
+    }
+  }
+
+  isDirectBusinessWebsite(url) {
+    const directIndicators = [
+      // Common business website patterns
+      /^https?:\/\/(?:www\.)?[^\/]+\.(com|org|net|co|biz|info|restaurant|hotel)(?:\/|$)/i,
+      // Avoid booking platforms
+      !/booking|tripadvisor|yelp|opentable|zenhotels|expedia|hotels\.com/i.test(url)
+    ];
+    
+    return directIndicators.every(test => {
+      if (test instanceof RegExp) {
+        return test.test(url);
+      }
+      return test;
+    });
+  }
+
+  isValidBusinessURL(url) {
+    // Check if URL looks like a valid business-related URL
+    return url.startsWith('http') && 
+           url.length > 10 && 
+           !url.includes('javascript') &&
+           !url.includes('google.com/search');
   }
 
   extractHours(element) {
