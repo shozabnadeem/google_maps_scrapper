@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Google Maps Results Scraper",
+  "name": "SearchNMap - Google Search & Maps Scraper",
   "version": "1.0",
-  "description": "Scrape all Google Maps search results with pagination support",
+  "description": "Scrape Google Search results and Maps listings instantly into CSV.",
   "permissions": [
     "activeTab",
     "scripting",
@@ -26,7 +26,7 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Google Maps Scraper"
+    "default_title": "SearchNMap - Google Maps & Search Scraper"
   },
   "background": {
     "service_worker": "background.js"
