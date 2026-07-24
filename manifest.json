@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SearchNMap - Google Search & Maps Scraper",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Scrape Google Search results and Maps listings instantly into CSV.",
   "permissions": [
     "activeTab",

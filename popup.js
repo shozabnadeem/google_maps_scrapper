@@ -19,7 +19,7 @@ class MapsScraperPopup {
     document.getElementById('exportData').addEventListener('click', () => this.exportData());
     
     // Save settings on change
-    ['delay', 'maxResults', 'exportFormat'].forEach(id => {
+    ['delay', 'maxResults', 'reviewLimit', 'exportFormat'].forEach(id => {
       document.getElementById(id).addEventListener('change', () => this.saveSettings());
     });
   }
@@ -246,6 +246,7 @@ class MapsScraperPopup {
     return {
       delay: parseInt(document.getElementById('delay').value) || 2000,
       maxResults: parseInt(document.getElementById('maxResults').value) || 0,
+      reviewLimit: parseInt(document.getElementById('reviewLimit').value) || 0,
       exportFormat: document.getElementById('exportFormat').value
     };
   }
@@ -262,6 +263,7 @@ class MapsScraperPopup {
         const settings = result.scraperSettings;
         document.getElementById('delay').value = settings.delay || 2000;
         document.getElementById('maxResults').value = settings.maxResults || 0;
+        document.getElementById('reviewLimit').value = settings.reviewLimit ?? 20;
         document.getElementById('exportFormat').value = settings.exportFormat || 'json';
       }
     } catch (error) {
@@ -310,10 +312,12 @@ class MapsScraperPopup {
     
     const csvRows = data.map(row => {
       return headers.map(header => {
-        const value = row[header] || '';
+        let value = row[header] || '';
+        // Flatten nested data (e.g. reviews array) into a JSON string cell
+        if (typeof value === 'object') value = JSON.stringify(value);
         // Escape quotes and wrap in quotes if contains comma or quote
-        return typeof value === 'string' && (value.includes(',') || value.includes('"')) 
-          ? `"${value.replace(/"/g, '""')}"` 
+        return typeof value === 'string' && (value.includes(',') || value.includes('"'))
+          ? `"${value.replace(/"/g, '""')}"`
           : value;
       }).join(',');
     });
@@ -325,10 +329,11 @@ class MapsScraperPopup {
     return data.map((item, index) => {
       return `${index + 1}. ${item.name || 'Unknown'}\n` +
              `   Website: ${item.website || 'N/A'}\n` +
-             `   Address: ${item.address || 'N/A'}\n` +
-             `   Rating: ${item.rating || 'N/A'}\n` +
+             `   Address: ${item.fullAddress || 'N/A'}\n` +
+             `   Rating: ${item.averageRating || 'N/A'}\n` +
              `   Phone: ${item.phone || 'N/A'}\n` +
-             `   Type: ${item.type || 'N/A'}\n\n`;
+             `   Categories: ${item.categories || 'N/A'}\n` +
+             `   Reviews collected: ${(item.reviews && item.reviews.length) || 0}\n\n`;
     }).join('');
   }
 

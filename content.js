@@ -1,4 +1,11 @@
 // Content script for Google Maps scraping
+// Guard against double-injection (Chrome can inject the content script more than
+// once on SPA navigation), which would throw "Identifier already declared".
+if (window.__googleMapsScraperLoaded) {
+  console.log('Google Maps Scraper already loaded - skipping re-init');
+} else {
+  window.__googleMapsScraperLoaded = true;
+
 class GoogleMapsScraper {
   constructor() {
     this.isActive = false;
@@ -6,7 +13,8 @@ class GoogleMapsScraper {
     this.processedElements = new Set();
     this.settings = {
       delay: 4000,
-      maxResults: 0
+      maxResults: 0,
+      reviewLimit: 20
     };
     this.scrollAttempts = 0;
     this.maxScrollAttempts = 50;
@@ -72,6 +80,7 @@ class GoogleMapsScraper {
 
     console.log('Starting Google Maps scraping with settings:', this.settings);
     this.isActive = true;
+    this.isStopped = false;
     this.results = [];
     this.processedElements.clear();
     this.scrollAttempts = 0;
@@ -101,63 +110,90 @@ class GoogleMapsScraper {
   }
 
   stopScraping() {
+    // Guard: many code paths can trigger a stop; only run once so the file
+    // isn't saved/downloaded twice.
+    if (this.isStopped) return;
+    this.isStopped = true;
     console.log('Stopping scraper - no more results available');
+    this.finalize(false);
+  }
+
+  stopScrapingByUser() {
+    if (this.isStopped) return;
+    this.isStopped = true;
+    console.log('Stopping scraper - user requested stop');
+    this.finalize(true);
+  }
+
+  // Tear down list-scanning, run the reviews pass, then save + notify. Runs once.
+  async finalize(stoppedByUser) {
     this.isActive = false;
-    
-    if (this.observer) {
-      this.observer.disconnect();
-    }
-    
+    if (this.observer) this.observer.disconnect();
     clearTimeout(this.scrollTimeout);
     clearTimeout(this.scrapingTimeout);
     this.stopAutoSave();
 
-    // Reset scraper state for next run
-    this.resetScraperState();
+    // Second pass: collect reviews per business (opt-in). Done here, after the
+    // whole list is scrolled, so opening place panels can't reset list scroll.
+    if ((this.settings.reviewLimit || 0) > 0 && this.results.length > 0) {
+      try {
+        await this.scrapeAllReviews();
+      } catch (error) {
+        console.log('Review phase error:', error);
+      }
+    }
 
-    // Save final results and trigger download
+    this.resetScraperState();
     this.saveResultsToFile(true);
-    
-    // Only send message if extension context is valid
+
     if (this.isExtensionContextValid()) {
-      this.sendMessage('scrapingComplete', {
+      this.sendMessage(stoppedByUser ? 'scrapingStopped' : 'scrapingComplete', {
         results: this.results,
         total: this.results.length,
-        stoppedByUser: false
+        stoppedByUser: stoppedByUser
       });
     } else {
       console.log('Extension context invalid - cannot send completion message');
     }
   }
 
-  stopScrapingByUser() {
-    console.log('Stopping scraper - user requested stop');
-    this.isActive = false;
-    
-    if (this.observer) {
-      this.observer.disconnect();
-    }
-    
-    clearTimeout(this.scrollTimeout);
-    clearTimeout(this.scrapingTimeout);
-    this.stopAutoSave();
+  // For each collected result, find its still-loaded list card, open it, and
+  // scrape reviews. Cards remain in the DOM after scrolling, so we match by name.
+  async scrapeAllReviews() {
+    console.log(`Review phase: collecting reviews for ${this.results.length} businesses`);
+    for (let i = 0; i < this.results.length; i++) {
+      if (!this.isExtensionContextValid()) break;
 
-    // Reset scraper state for next run
-    this.resetScraperState();
+      const result = this.results[i];
+      const card = this.findCardByName(result.name);
+      if (!card) {
+        console.log('Review phase: card not found for', result.name);
+        continue;
+      }
 
-    // Save final results and trigger download
-    this.saveResultsToFile(true);
-    
-    // Only send message if extension context is valid
-    if (this.isExtensionContextValid()) {
-      this.sendMessage('scrapingStopped', {
+      const panelData = await this.getReviews(card, this.settings.reviewLimit);
+      result.reviews = panelData.reviews;
+      // Prefer the panel phone (list rows usually lack it, esp. non-US numbers).
+      if (panelData.phone) {
+        result.phone = panelData.phone;
+        result.phones = [panelData.phone];
+      }
+
+      this.sendMessage('scrapingUpdate', {
         results: this.results,
-        total: this.results.length,
-        stoppedByUser: true
+        progress: 95 + Math.round(((i + 1) / this.results.length) * 5)
       });
-    } else {
-      console.log('Extension context invalid - cannot send stop message');
     }
+  }
+
+  findCardByName(name) {
+    if (!name) return null;
+    const cards = document.querySelectorAll('.Nv2PK.THOPZb');
+    for (const card of cards) {
+      const cardName = card.querySelector('.qBF1Pd, .fontHeadlineSmall')?.textContent?.trim();
+      if (cardName && cardName === name) return card;
+    }
+    return null;
   }
 
   async startScrolling() {
@@ -291,6 +327,20 @@ class GoogleMapsScraper {
   async scrapeVisibleResults() {
     if (!this.isActive) return;
 
+    // Guard against concurrent runs. Opening a business panel + scrolling reviews
+    // fires many DOM mutations, which re-triggers the MutationObserver. Without this
+    // guard those overlapping runs open nested panels and break the list navigation.
+    if (this.isBatchRunning) return;
+    this.isBatchRunning = true;
+
+    try {
+      await this._scrapeVisibleResultsInner();
+    } finally {
+      this.isBatchRunning = false;
+    }
+  }
+
+  async _scrapeVisibleResultsInner() {
     // Check if extension context is still valid
     if (!this.isExtensionContextValid()) {
       console.log('Extension context invalidated - stopping scraper');
@@ -480,16 +530,37 @@ class GoogleMapsScraper {
       // Get additional data by clicking if needed
       const additionalData = await this.getAdditionalData(element);
 
+      // Identifiers + coordinates parsed from the result's Maps link (no panel open needed)
+      const ids = this.extractPlaceIdentifiers(element);
+
+      // Reviews are collected in a second pass AFTER the whole list is scrolled,
+      // because opening a place panel navigates away and would reset list scroll.
       return {
         name: name || 'Unknown',
-        website: website || '',
-        rating: rating,
-        reviewCount: reviewCount,
-        address: address || '',
-        type: type || '',
+        description: additionalData.description || '',
+        fullAddress: address || '',
+        street: this.parseStreet(address),
+        municipality: this.parseMunicipality(address),
+        categories: type || '',
+        timeZone: additionalData.timeZone || '',
+        amenities: additionalData.amenities || '',
         phone: phone || '',
-        hours: hours || '',
-        priceLevel: priceLevel || '',
+        phones: phone ? [phone] : [],
+        claimed: additionalData.claimed ?? '',
+        reviewCount: reviewCount,
+        averageRating: rating,
+        reviewUrl: ids.reviewUrl,
+        googleMapsUrl: ids.googleMapsUrl,
+        latitude: ids.latitude,
+        longitude: ids.longitude,
+        website: website || '',
+        domain: this.extractDomain(website),
+        openingHours: hours || '',
+        featuredImage: this.extractFeaturedImage(element),
+        cid: ids.cid,
+        fid: ids.fid,
+        placeId: ids.placeId,
+        reviews: [],
         scrapedAt: new Date().toISOString(),
         ...additionalData
       };
@@ -706,7 +777,7 @@ class GoogleMapsScraper {
               const url = websiteAnchor.href;
               if (url && this.isValidBusinessURL(url) && !url.includes('google.com/search')) {
                 console.log(`Found website via aria-label in modal: ${url}`);
-                await this.closeModal(modal);
+                await this.closeDetailPanel();
                 return url.trim();
               }
             }
@@ -750,14 +821,14 @@ class GoogleMapsScraper {
                   console.log(`Found website in modal: ${url}`);
                   
                   // Close modal
-                  await this.closeModal(modal);
+                  await this.closeDetailPanel();
                   return url.trim();
                 }
               }
             }
             
             // Close modal if no website found
-            await this.closeModal(modal);
+            await this.closeDetailPanel();
           }
         }
       } catch (error) {
@@ -840,6 +911,267 @@ class GoogleMapsScraper {
     // This method could be extended to click on elements and extract more data
     // For now, return empty object to avoid complications
     return {};
+  }
+
+  // Parse identifiers + coordinates out of the result's Google Maps link.
+  // Example href: /maps/place/Name/data=!...!1s0x47e6..:0x651a..!...!3d48.85!4d2.36!...!19sChIJ...
+  extractPlaceIdentifiers(element) {
+    const out = { cid: '', fid: '', placeId: '', latitude: '', longitude: '', googleMapsUrl: '', reviewUrl: '' };
+    try {
+      const anchor = element.querySelector('a.hfpxzc') ||
+                     element.querySelector('a[href*="/maps/place/"]');
+      const href = anchor?.href || '';
+      if (!href) return out;
+      out.googleMapsUrl = href;
+
+      const fidMatch = href.match(/!1s(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)/);
+      if (fidMatch) {
+        out.fid = fidMatch[1];
+        const cidHex = fidMatch[1].split(':')[1];
+        try { out.cid = BigInt(cidHex).toString(); } catch (e) {}
+      }
+
+      const latMatch = href.match(/!3d(-?\d+\.\d+)/);
+      const lngMatch = href.match(/!4d(-?\d+\.\d+)/);
+      if (latMatch) out.latitude = latMatch[1];
+      if (lngMatch) out.longitude = lngMatch[1];
+
+      const pidMatch = href.match(/!19s([^!?&]+)/);
+      if (pidMatch) out.placeId = decodeURIComponent(pidMatch[1]);
+
+      if (out.placeId) {
+        out.reviewUrl = `https://search.google.com/local/reviews?placeid=${out.placeId}`;
+      } else if (out.cid) {
+        out.reviewUrl = `https://www.google.com/maps?cid=${out.cid}`;
+      }
+    } catch (e) {
+      console.log('Error parsing place identifiers:', e);
+    }
+    return out;
+  }
+
+  extractDomain(url) {
+    if (!url) return '';
+    try {
+      return new URL(url).hostname.replace(/^www\./, '');
+    } catch (e) {
+      return '';
+    }
+  }
+
+  extractFeaturedImage(element) {
+    const img = element.querySelector('img[src^="http"]');
+    return img?.src || '';
+  }
+
+  // ponytail: best-effort split of the list-row address; the precise Fulladdress /
+  // Street / Municipality come from the detail panel once that HTML is wired in.
+  parseStreet(address) {
+    if (!address) return '';
+    return address.split(',')[0].replace(/·/g, '').trim();
+  }
+
+  parseMunicipality(address) {
+    if (!address) return '';
+    const parts = address.split(',');
+    return parts.length > 1 ? parts[1].trim() : '';
+  }
+
+  // Open the business detail panel, switch to its Reviews tab, and collect up to
+  // `limit` reviews. Reviews are lazy-loaded (infinite scroll), so we scroll the
+  // reviews pane until enough load or growth stalls. Always restores the list view.
+  async getReviews(element, limit) {
+    const out = { reviews: [], phone: '' };
+    if (!limit || limit <= 0) return out;
+
+    const reviews = out.reviews;
+    let opened = false;
+    try {
+      const businessName = element.querySelector('.qBF1Pd, .fontHeadlineSmall, [class*="headline"]')?.textContent?.trim();
+      // The full-card anchor opens the place detail panel in-pane.
+      const clickable = element.querySelector('a.hfpxzc') ||
+                        element.querySelector('.hfpxzc') ||
+                        element.querySelector('[role="button"]');
+      if (!clickable) return out;
+
+      clickable.click();
+      opened = true;
+      await this.wait(this.settings.delay);
+
+      // Grab the phone from the Overview panel before switching tabs (it's shown
+      // there as data-item-id="phone:tel:..."). List rows rarely include it.
+      out.phone = this.extractPanelPhone();
+
+      // Switch to the Reviews tab so the full lazy list loads (not the preview snippets).
+      const reviewsTab = this.findReviewsTab();
+      if (!reviewsTab) {
+        console.log('Reviews tab not found - skipping reviews for', businessName);
+        return out;
+      }
+      reviewsTab.click();
+      await this.wait(this.settings.delay);
+
+      // Scroll the reviews pane until enough load or growth stalls. Reviews are
+      // lazy-loaded on scroll, so we re-find the scroller each pass (it may not
+      // exist yet on the first) and fire a scroll event to trigger loading.
+      let stagnant = 0;
+      while (stagnant < 5 && this.isExtensionContextValid()) {
+        this.expandReviewText();
+
+        const before = document.querySelectorAll('.jftiEf').length;
+        if (before >= limit) break;
+
+        this.scrollReviewsToBottom();
+        await this.wait(2000);
+
+        const after = document.querySelectorAll('.jftiEf').length;
+        if (after <= before) stagnant++; else stagnant = 0;
+      }
+
+      // Final expand pass so cards loaded on the last scroll get their full text too.
+      this.expandReviewText();
+
+      const reviewEls = document.querySelectorAll('.jftiEf');
+      for (const r of reviewEls) {
+        if (reviews.length >= limit) break;
+        const parsed = this.extractReview(r);
+        if (parsed.author || parsed.text) reviews.push(parsed);
+      }
+
+      console.log(`Collected ${reviews.length} reviews for ${businessName || 'business'}`);
+    } catch (error) {
+      console.log('Error scraping reviews:', error);
+    } finally {
+      // Must return to the list before the next result is clicked, or that click
+      // navigates to a fresh place URL and breaks the run.
+      if (opened) await this.closeDetailPanel();
+    }
+
+    return out;
+  }
+
+  // Phone from the open place panel. Maps stores it as data-item-id="phone:tel:+33..".
+  extractPanelPhone() {
+    const btn = document.querySelector('button[data-item-id^="phone:tel:"], [data-item-id^="phone:tel:"]');
+    if (btn) {
+      const id = btn.getAttribute('data-item-id') || '';
+      const m = id.match(/phone:tel:(.+)/);
+      if (m) return decodeURIComponent(m[1]);
+      const label = btn.getAttribute('aria-label') || '';
+      return label.replace(/^Phone:\s*/i, '').trim();
+    }
+    return '';
+  }
+
+  // Click Google's native "More" buttons (.w8nwRe) to reveal full review text.
+  // Deliberately ignores 3rd-party links like "Read more on Tripadvisor/Trip.com".
+  expandReviewText() {
+    document.querySelectorAll('.jftiEf .w8nwRe').forEach(btn => {
+      try { btn.click(); } catch (e) {}
+    });
+  }
+
+  findReviewsTab() {
+    const tabs = document.querySelectorAll('[role="tab"]');
+    for (const tab of tabs) {
+      const label = (tab.getAttribute('aria-label') || tab.textContent || '').toLowerCase();
+      if (label.includes('review')) return tab;
+    }
+    return null;
+  }
+
+  // Trigger the reviews lazy-load. Layout-independent: scroll every scrollable
+  // ancestor of the review cards to the bottom and fire wheel + scroll events
+  // (Google loads more via a scroll/IntersectionObserver on the list bottom).
+  scrollReviewsToBottom() {
+    const containers = new Set();
+
+    // Known dedicated reviews scrollbox, if present.
+    const known = document.querySelector('.m6QErb.DxyBCb.kA9KIf.dS8AEf');
+    if (known) containers.add(known);
+
+    // Any scrollable ancestor of a review card.
+    document.querySelectorAll('.jftiEf').forEach(card => {
+      let node = card.parentElement;
+      while (node && node !== document.body) {
+        const oy = getComputedStyle(node).overflowY;
+        if ((oy === 'auto' || oy === 'scroll') && node.scrollHeight > node.clientHeight) {
+          containers.add(node);
+        }
+        node = node.parentElement;
+      }
+    });
+
+    containers.forEach(node => {
+      node.scrollTo(0, node.scrollHeight);
+      node.dispatchEvent(new WheelEvent('wheel', { deltaY: 2000, bubbles: true }));
+      node.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    // Bring the last card into view as a fallback (forces its scroll parent down).
+    const cards = document.querySelectorAll('.jftiEf');
+    if (cards.length) cards[cards.length - 1].scrollIntoView({ block: 'end' });
+  }
+
+  extractReview(el) {
+    const author = el.querySelector('.d4r55')?.textContent?.trim() || '';
+
+    // Rating comes two ways: native Google star reviews use a role=img aria-label
+    // ("5 stars"); aggregated (hotel) reviews show a "5/5" text node (.fzvQIb).
+    let rating = null;
+    const starEl = el.querySelector('[role="img"][aria-label*="star"]');
+    if (starEl) {
+      const m = (starEl.getAttribute('aria-label') || '').match(/(\d+(?:\.\d+)?)/);
+      if (m) rating = parseFloat(m[1]);
+    }
+    if (rating === null) {
+      const scoreEl = el.querySelector('.fzvQIb');
+      const m = scoreEl?.textContent?.match(/(\d+(?:\.\d+)?)\s*\/\s*\d+/);
+      if (m) rating = parseFloat(m[1]);
+    }
+
+    const text = el.querySelector('.wiI7pd, .MyEned')?.textContent?.trim() || '';
+
+    // Date node varies by layout; some glue rating+date+source together
+    // ("5/52 months ago on Google"). Strip a leading "N/N" rating and a
+    // trailing "on <source>" so only the relative time remains.
+    let when = el.querySelector('.rsqaWe, .DZSIDd, .DU9Pgb')?.textContent?.trim() || '';
+    when = when
+      .replace(/^\s*\d+(?:\.\d+)?\s*\/\s*\d+\s*/, '') // drop leading "2.5/5"
+      .replace(/\s*on\s+[\w.]+\s*$/i, '')             // drop trailing "on Trip.com"
+      .trim();
+
+    return { author, rating, text, when };
+  }
+
+  // Return from a place detail view to the search results list. Opening a place
+  // replaces the list, so we must navigate back to it (the "Back" arrow, not an X)
+  // before the next result is clicked. Verify the list actually reappeared.
+  async closeDetailPanel() {
+    const listPresent = () => !!document.querySelector('.Nv2PK.THOPZb');
+
+    // If the list never left (rare), nothing to do.
+    if (listPresent()) return;
+
+    const attempts = [
+      () => document.querySelector('button[aria-label="Back"], [jsaction*="pane.back"], [jsaction*="back"]')?.click(),
+      () => document.querySelector('button[aria-label="Close"], button[jsaction*="close"]')?.click(),
+      () => window.history.back(),
+      () => document.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Escape', code: 'Escape', keyCode: 27, charCode: 27, bubbles: true
+      }))
+    ];
+
+    for (const tryClose of attempts) {
+      try { tryClose(); } catch (e) {}
+      // Poll up to ~2s for the results list to come back.
+      for (let i = 0; i < 4; i++) {
+        await this.wait(500);
+        if (listPresent()) return;
+      }
+    }
+
+    console.log('Warning: could not restore results list after visiting place');
   }
 
   isValidResult(result) {
@@ -1020,10 +1352,12 @@ class GoogleMapsScraper {
     
     const csvRows = data.map(row => {
       return headers.map(header => {
-        const value = row[header] || '';
+        let value = row[header] || '';
+        // Flatten nested data (e.g. reviews array) into a JSON string cell
+        if (typeof value === 'object') value = JSON.stringify(value);
         // Escape quotes and wrap in quotes if contains comma or quote
-        return typeof value === 'string' && (value.includes(',') || value.includes('"')) 
-          ? `"${value.replace(/"/g, '""')}"` 
+        return typeof value === 'string' && (value.includes(',') || value.includes('"'))
+          ? `"${value.replace(/"/g, '""')}"`
           : value;
       }).join(',');
     });
@@ -1035,10 +1369,11 @@ class GoogleMapsScraper {
     return data.map((item, index) => {
       return `${index + 1}. ${item.name || 'Unknown'}\n` +
              `   Website: ${item.website || 'N/A'}\n` +
-             `   Address: ${item.address || 'N/A'}\n` +
-             `   Rating: ${item.rating || 'N/A'}\n` +
+             `   Address: ${item.fullAddress || 'N/A'}\n` +
+             `   Rating: ${item.averageRating || 'N/A'}\n` +
              `   Phone: ${item.phone || 'N/A'}\n` +
-             `   Type: ${item.type || 'N/A'}\n\n`;
+             `   Categories: ${item.categories || 'N/A'}\n` +
+             `   Reviews collected: ${(item.reviews && item.reviews.length) || 0}\n\n`;
     }).join('');
   }
 
@@ -1068,3 +1403,5 @@ if (document.readyState === 'loading') {
 } else {
   new GoogleMapsScraper();
 }
+
+} // end double-injection guard
