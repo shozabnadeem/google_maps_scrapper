@@ -17,10 +17,11 @@ class GoogleMapsScraper {
       reviewLimit: 20
     };
     this.scrollAttempts = 0;
-    this.maxScrollAttempts = 50;
     this.lastResultCount = 0;
     this.noNewResultsCount = 0;
-    this.maxNoNewResults = 3;
+    // ponytail: stall guard only - the real stop is Google's "You've reached the
+    // end of the list." marker. Raise if a slow connection ever trips it early.
+    this.maxNoNewResults = 30;
     this.autoSaveInterval = null;
     
     this.init();
@@ -242,7 +243,9 @@ class GoogleMapsScraper {
     // Update progress
     this.sendMessage('scrapingUpdate', {
       results: this.results,
-      progress: Math.min((this.scrollAttempts / this.maxScrollAttempts) * 100, 95)
+      progress: this.settings.maxResults > 0
+        ? Math.min((this.results.length / this.settings.maxResults) * 100, 95)
+        : Math.min(this.scrollAttempts * 2, 95)
     });
 
     // Check if we should continue scrolling
@@ -253,20 +256,19 @@ class GoogleMapsScraper {
     }
 
     this.scrollAttempts++;
-    
-    // Stop conditions
-    const shouldStop = 
+
+    // Stop conditions - keep scrolling until Google says the list is finished
+    const endOfList = this.isEndOfList();
+    const shouldStop =
+      endOfList ||
       this.noNewResultsCount >= this.maxNoNewResults ||
-      this.scrollAttempts >= this.maxScrollAttempts ||
-      (this.settings.maxResults > 0 && this.results.length >= this.settings.maxResults) ||
-      !this.hasMoreResults(resultsPanel);
+      (this.settings.maxResults > 0 && this.results.length >= this.settings.maxResults);
 
     if (shouldStop) {
       console.log('Stopping scrolling. Reason:', {
-        noNewResults: this.noNewResultsCount >= this.maxNoNewResults,
-        maxAttempts: this.scrollAttempts >= this.maxScrollAttempts,
-        maxResults: this.settings.maxResults > 0 && this.results.length >= this.settings.maxResults,
-        noMoreResults: !this.hasMoreResults(resultsPanel)
+        endOfList: endOfList,
+        stalled: this.noNewResultsCount >= this.maxNoNewResults,
+        maxResults: this.settings.maxResults > 0 && this.results.length >= this.settings.maxResults
       });
       this.stopScraping(); // Natural completion
     } else {
@@ -277,16 +279,22 @@ class GoogleMapsScraper {
     }
   }
 
-  hasMoreResults(resultsPanel) {
-    // Check if there's more content to load by looking for loading indicators
-    const loadingIndicators = resultsPanel.querySelectorAll('[data-value="Searching"]', '.loading', '[aria-label*="Loading"]');
-    if (loadingIndicators.length > 0) {
-      return true;
+  // Google appends "You've reached the end of the list." (span.HlvSq) once the
+  // feed is exhausted. That marker - not scroll position - is the end signal:
+  // being at the bottom only means the next batch hasn't loaded yet.
+  isEndOfList() {
+    // Scanned on document, not the panel: the notice sometimes lands outside
+    // whichever element findResultsPanel() picked.
+    const root = document;
+    if (root.querySelector('span.HlvSq')) return true;
+
+    // Class names change; fall back to the text itself
+    const notices = root.querySelectorAll('.PbZDve p, .fontBodyMedium');
+    for (const notice of notices) {
+      if (notice.textContent.toLowerCase().includes("end of the list")) return true;
     }
 
-    // Check if we can scroll more
-    const isScrolledToBottom = resultsPanel.scrollTop + resultsPanel.clientHeight >= resultsPanel.scrollHeight - 10;
-    return !isScrolledToBottom;
+    return false;
   }
 
   findResultsPanel() {
