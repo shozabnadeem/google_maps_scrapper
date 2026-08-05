@@ -134,6 +134,13 @@ class GoogleMapsScraper {
     clearTimeout(this.scrapingTimeout);
     this.stopAutoSave();
 
+    // A stop triggered from inside scrapeVisibleResults (maxResults) leaves that
+    // pass still running - and it opens/closes website modals, which steals the
+    // detail panel from the review phase. Let it drain first.
+    for (let i = 0; i < 40 && this.isBatchRunning; i++) {
+      await this.wait(250);
+    }
+
     // Second pass: collect reviews per business (opt-in). Done here, after the
     // whole list is scrolled, so opening place panels can't reset list scroll.
     if ((this.settings.reviewLimit || 0) > 0 && this.results.length > 0) {
@@ -172,7 +179,7 @@ class GoogleMapsScraper {
         continue;
       }
 
-      const panelData = await this.getReviews(card, this.settings.reviewLimit);
+      const panelData = await this.getReviews(card, this.settings.reviewLimit, result.name);
       result.reviews = panelData.reviews;
       // Prefer the panel phone (list rows usually lack it, esp. non-US numbers).
       if (panelData.phone) {
@@ -988,14 +995,15 @@ class GoogleMapsScraper {
   // Open the business detail panel, switch to its Reviews tab, and collect up to
   // `limit` reviews. Reviews are lazy-loaded (infinite scroll), so we scroll the
   // reviews pane until enough load or growth stalls. Always restores the list view.
-  async getReviews(element, limit) {
+  async getReviews(element, limit, expectedName) {
     const out = { reviews: [], phone: '' };
     if (!limit || limit <= 0) return out;
 
     const reviews = out.reviews;
     let opened = false;
     try {
-      const businessName = element.querySelector('.qBF1Pd, .fontHeadlineSmall, [class*="headline"]')?.textContent?.trim();
+      const businessName = expectedName ||
+        element.querySelector('.qBF1Pd, .fontHeadlineSmall, [class*="headline"]')?.textContent?.trim();
       // The full-card anchor opens the place detail panel in-pane.
       const clickable = element.querySelector('a.hfpxzc') ||
                         element.querySelector('.hfpxzc') ||
@@ -1004,14 +1012,28 @@ class GoogleMapsScraper {
 
       clickable.click();
       opened = true;
-      await this.wait(this.settings.delay);
+
+      // Wait for THIS business's panel. Everything below is scoped to it: the
+      // previous place's review cards linger in the DOM, so a global .jftiEf
+      // query copies the last business's reviews onto this one.
+      if (!await this.waitForPlacePanel(businessName)) {
+        console.log('Place panel never opened for', businessName, '- skipping reviews');
+        return out;
+      }
+
+      // Re-resolved on every read, never cached: clicking the Reviews tab
+      // re-renders the panel, and a held reference goes detached (queries on a
+      // detached node silently return nothing - that's the empty [] rows).
+      const panel = () => this.findPlacePanel(businessName) || document;
 
       // Grab the phone from the Overview panel before switching tabs (it's shown
       // there as data-item-id="phone:tel:..."). List rows rarely include it.
-      out.phone = this.extractPanelPhone();
+      out.phone = this.extractPanelPhone(panel());
 
       // Switch to the Reviews tab so the full lazy list loads (not the preview snippets).
-      const reviewsTab = this.findReviewsTab();
+      // Polled: the tab strip renders a beat after the panel, and a short user
+      // delay (500ms) meant a single immediate check always missed it.
+      const reviewsTab = await this.waitForReviewsTab(panel);
       if (!reviewsTab) {
         console.log('Reviews tab not found - skipping reviews for', businessName);
         return out;
@@ -1019,27 +1041,32 @@ class GoogleMapsScraper {
       reviewsTab.click();
       await this.wait(this.settings.delay);
 
+      // Maps sometimes reuses the panel node and only swaps its label, leaving the
+      // previous place's cards mounted for a beat. Wait until the first card is
+      // actually different from the last business's before reading anything.
+      await this.waitForFreshReviews(panel);
+
       // Scroll the reviews pane until enough load or growth stalls. Reviews are
       // lazy-loaded on scroll, so we re-find the scroller each pass (it may not
       // exist yet on the first) and fire a scroll event to trigger loading.
       let stagnant = 0;
       while (stagnant < 5 && this.isExtensionContextValid()) {
-        this.expandReviewText();
+        this.expandReviewText(panel());
 
-        const before = document.querySelectorAll('.jftiEf').length;
+        const before = panel().querySelectorAll('.jftiEf').length;
         if (before >= limit) break;
 
-        this.scrollReviewsToBottom();
+        this.scrollReviewsToBottom(panel());
         await this.wait(2000);
 
-        const after = document.querySelectorAll('.jftiEf').length;
+        const after = panel().querySelectorAll('.jftiEf').length;
         if (after <= before) stagnant++; else stagnant = 0;
       }
 
       // Final expand pass so cards loaded on the last scroll get their full text too.
-      this.expandReviewText();
+      this.expandReviewText(panel());
 
-      const reviewEls = document.querySelectorAll('.jftiEf');
+      const reviewEls = panel().querySelectorAll('.jftiEf');
       for (const r of reviewEls) {
         if (reviews.length >= limit) break;
         const parsed = this.extractReview(r);
@@ -1058,9 +1085,70 @@ class GoogleMapsScraper {
     return out;
   }
 
+  // Block until the visible reviews differ from the ones read for the previous
+  // business. Two places sharing an identical first review just costs the timeout.
+  async waitForFreshReviews(panel, timeout = 8000) {
+    const root = () => (typeof panel === 'function' ? panel() : panel);
+    const signature = () => root().querySelector('.jftiEf')?.textContent?.trim().slice(0, 160) || '';
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+      const current = signature();
+      if (current && current !== this.lastReviewSignature) break;
+      await this.wait(300);
+    }
+
+    this.lastReviewSignature = signature();
+  }
+
+  // The open place's own panel: a role="main" whose aria-label is the business
+  // name (the results list is also role="main", labelled "Results for ..."), and
+  // whose h1 title matches. Waited on because the panel swaps in asynchronously -
+  // acting before it does reads the PREVIOUS place's still-mounted DOM.
+  async waitForPlacePanel(expectedName, timeout = 12000) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const panel = this.findPlacePanel(expectedName);
+      if (panel) return panel;
+      await this.wait(300);
+    }
+    return null;
+  }
+
+  findPlacePanel(expectedName) {
+    // Punctuation and spacing differ between the list row and the panel label
+    // ("Dr. Smith & Co." vs "Dr Smith and Co"), so compare on a squashed form.
+    const norm = s => (s || '').toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
+    const wanted = norm(expectedName);
+    const panels = document.querySelectorAll('[role="main"][aria-label]');
+    let fallback = null;
+
+    for (const panel of panels) {
+      const label = (panel.getAttribute('aria-label') || '').trim();
+      if (!label || /^results for/i.test(label)) continue;
+
+      // No name to match against: any non-list panel will do.
+      if (!wanted) return panel;
+
+      const title = norm(panel.querySelector('h1.DUwDvf, h1')?.textContent);
+      const labelNorm = norm(label);
+      if (labelNorm === wanted || title === wanted) return panel;
+      if (labelNorm.includes(wanted) || wanted.includes(labelNorm)) fallback = fallback || panel;
+    }
+
+    // Exactly one place panel open and no name matched: trust it rather than
+    // dropping the reviews - a hard miss here is what produced empty [] rows.
+    if (!fallback && panels.length) {
+      const open = [...panels].filter(p => !/^results for/i.test(p.getAttribute('aria-label') || ''));
+      if (open.length === 1) return open[0];
+    }
+
+    return fallback;
+  }
+
   // Phone from the open place panel. Maps stores it as data-item-id="phone:tel:+33..".
-  extractPanelPhone() {
-    const btn = document.querySelector('button[data-item-id^="phone:tel:"], [data-item-id^="phone:tel:"]');
+  extractPanelPhone(root = document) {
+    const btn = root.querySelector('button[data-item-id^="phone:tel:"], [data-item-id^="phone:tel:"]');
     if (btn) {
       const id = btn.getAttribute('data-item-id') || '';
       const m = id.match(/phone:tel:(.+)/);
@@ -1073,14 +1161,14 @@ class GoogleMapsScraper {
 
   // Click Google's native "More" buttons (.w8nwRe) to reveal full review text.
   // Deliberately ignores 3rd-party links like "Read more on Tripadvisor/Trip.com".
-  expandReviewText() {
-    document.querySelectorAll('.jftiEf .w8nwRe').forEach(btn => {
+  expandReviewText(root = document) {
+    root.querySelectorAll('.jftiEf .w8nwRe').forEach(btn => {
       try { btn.click(); } catch (e) {}
     });
   }
 
-  findReviewsTab() {
-    const tabs = document.querySelectorAll('[role="tab"]');
+  findReviewsTab(root = document) {
+    const tabs = root.querySelectorAll('[role="tab"]');
     for (const tab of tabs) {
       const label = (tab.getAttribute('aria-label') || tab.textContent || '').toLowerCase();
       if (label.includes('review')) return tab;
@@ -1088,18 +1176,34 @@ class GoogleMapsScraper {
     return null;
   }
 
+  // The tab strip mounts after the panel does, and on some layouts it sits
+  // outside the panel's role="main" - so poll, then fall back to document scope.
+  // Only one place panel is open at a time, so a document-wide tab is still ours.
+  async waitForReviewsTab(panel, timeout = 6000) {
+    const root = () => (typeof panel === 'function' ? panel() : panel);
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+      const tab = this.findReviewsTab(root()) || this.findReviewsTab(document);
+      if (tab) return tab;
+      await this.wait(300);
+    }
+
+    return null;
+  }
+
   // Trigger the reviews lazy-load. Layout-independent: scroll every scrollable
   // ancestor of the review cards to the bottom and fire wheel + scroll events
   // (Google loads more via a scroll/IntersectionObserver on the list bottom).
-  scrollReviewsToBottom() {
+  scrollReviewsToBottom(root = document) {
     const containers = new Set();
 
     // Known dedicated reviews scrollbox, if present.
-    const known = document.querySelector('.m6QErb.DxyBCb.kA9KIf.dS8AEf');
+    const known = root.querySelector('.m6QErb.DxyBCb.kA9KIf.dS8AEf');
     if (known) containers.add(known);
 
     // Any scrollable ancestor of a review card.
-    document.querySelectorAll('.jftiEf').forEach(card => {
+    root.querySelectorAll('.jftiEf').forEach(card => {
       let node = card.parentElement;
       while (node && node !== document.body) {
         const oy = getComputedStyle(node).overflowY;
@@ -1117,7 +1221,7 @@ class GoogleMapsScraper {
     });
 
     // Bring the last card into view as a fallback (forces its scroll parent down).
-    const cards = document.querySelectorAll('.jftiEf');
+    const cards = root.querySelectorAll('.jftiEf');
     if (cards.length) cards[cards.length - 1].scrollIntoView({ block: 'end' });
   }
 

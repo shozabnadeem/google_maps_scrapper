@@ -107,6 +107,10 @@ class MapsScraperPopup {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const settings = this.getSettings();
 
+      // Reloading the extension leaves open tabs with a dead content script, so
+      // make sure a live one is there before dispatching the start event.
+      await this.ensureContentScript(tab.id);
+
       // Inject the scraper script
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
@@ -131,15 +135,40 @@ class MapsScraperPopup {
     }
   }
 
+  // A live content script must exist before any message is sent to the tab -
+  // otherwise every sendMessage fails with "Receiving end does not exist".
+  async ensureContentScript(tabId) {
+    try {
+      const [probe] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => !!window.__googleMapsScraperLoaded
+      });
+      if (probe?.result) return;
+    } catch (error) {
+      console.log('Content script probe failed, injecting:', error);
+    }
+
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
   stopScraping() {
     this.isScrapingActive = false;
     this.updateUI();
     this.updateStatus('Stopping scraper...');
-    
+
     // Send stop message to content script
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (tabs[0]) {
         chrome.tabs.sendMessage(tabs[0].id, { action: 'stopScraping' }, (response) => {
+          // No content script in the tab (stale after an extension reload). Reading
+          // lastError here is what stops Chrome logging it as an unchecked error.
+          if (chrome.runtime.lastError) {
+            console.log('Stop message not delivered:', chrome.runtime.lastError.message);
+            this.updateStatus('Scraper not running in this tab - reload the page', 'warning');
+            return;
+          }
+
           // Handle the response with current results
           if (response && response.results) {
             this.handleScrapingComplete({
