@@ -372,10 +372,10 @@ class GoogleMapsScraper {
         const resultData = await this.extractResultData(element);
         if (resultData && this.isValidResult(resultData)) {
           // Additional duplicate check by business name
-          const isDuplicate = this.results.some(existing => 
-            existing.name.toLowerCase().trim() === resultData.name.toLowerCase().trim() &&
-            existing.address.toLowerCase().trim() === resultData.address.toLowerCase().trim()
-          );
+          // Field is fullAddress, not address - `.address` was undefined, so this
+          // threw on every name match instead of skipping the duplicate.
+          const key = r => `${(r.name || '').toLowerCase().trim()}|${(r.fullAddress || '').toLowerCase().trim()}`;
+          const isDuplicate = this.results.some(existing => key(existing) === key(resultData));
           
           if (isDuplicate) {
             console.log('Skipping duplicate business:', resultData.name);
